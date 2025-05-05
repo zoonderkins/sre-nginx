@@ -1,0 +1,140 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'alpha'
+        type: choice
+        options:
+          - alpha
+          - beta
+          - staging
+          - production
+
+env:
+  REGISTRY: nrt.vultrcr.com
+  REPOSITORY: edoo/sre-nginx
+  IMAGE_TAG: ${{ github.sha }}
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'alpha' }}
+  EKS_CLUSTER_NAME: edoo-eks-cluster
+  AWS_REGION: us-east-1
+  ROLE_TO_ASSUME: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/edoo-eks-cluster-github-actions-role
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read    # Required to checkout the repository
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Login to Vultr Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.VULTR_REGISTRY_USERNAME }}
+          password: ${{ secrets.VULTR_REGISTRY_PASSWORD }}
+
+      - name: Build, tag, and push image to Vultr Container Registry
+        working-directory: ./nginx
+        run: |
+          docker build -t ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${{ env.IMAGE_TAG }} .
+          docker tag ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${{ env.IMAGE_TAG }} ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:latest
+          docker push ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${{ env.IMAGE_TAG }}
+          docker push ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:latest
+          echo "image=${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
+          role-session-name: GitHubActions-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Verify AWS Authentication
+        run: |
+          aws sts get-caller-identity
+          echo "Successfully authenticated with AWS"
+
+      - name: Update kubeconfig and setup kubectl auth
+        run: |
+          # Update kubeconfig WITHOUT specifying role-arn again
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+          
+          # Create custom kubectl config with AWS credentials directly
+          cat > $HOME/.kube/eks-config << EOF
+          apiVersion: v1
+          kind: Config
+          current-context: eks
+          clusters:
+          - name: eks
+            cluster:
+              server: $(kubectl config view -o jsonpath='{.clusters[0].cluster.server}')
+              certificate-authority-data: $(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+          contexts:
+          - name: eks
+            context:
+              cluster: eks
+              user: aws
+          users:
+          - name: aws
+            user:
+              exec:
+                apiVersion: client.authentication.k8s.io/v1beta1
+                command: aws
+                args:
+                  - "eks"
+                  - "get-token"
+                  - "--cluster-name"
+                  - "${{ env.EKS_CLUSTER_NAME }}"
+                  - "--region"
+                  - "${{ env.AWS_REGION }}"
+          EOF
+          
+          export KUBECONFIG=$HOME/.kube/eks-config
+          echo "KUBECONFIG=$KUBECONFIG" >> $GITHUB_ENV
+          
+          # Verify configuration
+          kubectl config current-context
+          
+          # Test access
+          echo "Testing cluster access..."
+          kubectl get namespaces || echo "Permission issues detected"
+          kubectl cluster-info
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl get namespace default || kubectl create namespace default
+          kubectl get pods -n default
+          
+          # Install using Helm
+          helm upgrade --install nginx-app ./k8s/helm/nginx-app \
+            --set image.repository=${{ env.REGISTRY }}/${{ env.REPOSITORY }} \
+            --set image.tag=${{ env.IMAGE_TAG }} \
+            --set environment=${{ env.ENVIRONMENT }}
+      
+      - name: Verify deployment
+        run: |
+          kubectl get pods -l app.kubernetes.io/name=nginx-app
+          kubectl get svc -l app.kubernetes.io/name=nginx-app
+          kubectl get ingress -l app.kubernetes.io/name=nginx-app 
